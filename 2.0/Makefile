@@ -57,7 +57,7 @@ endif
 %.o: %.cc
 	$(CXX) -c $(CXXFLAGS) $(ARCH32) -o $@ $<
 
-all: plink2 pgen_compress
+all: plink2 pgen_compress plinkSparse
 
 # for clean build, "make clean" first
 # Run mkdir for both plink2 and pgen_compress as we don't know which
@@ -65,6 +65,11 @@ all: plink2 pgen_compress
 plink2: $(OBJ)
 	$(MKDIR) -p bin
 	$(CXX) $(ARCH32) $(OBJ) -o bin/plink2 $(BLASFLAGS64) $(LDFLAGS)
+
+# Build plink2 with sparse matrix support as plinkSparse
+plinkSparse: $(OBJ)
+	$(MKDIR) -p bin
+	$(CXX) $(ARCH32) $(OBJ) -o bin/plinkSparse $(BLASFLAGS64) $(LDFLAGS)
 
 # basic pgenlib usage example; also needed for tests
 pgen_compress: $(PGCOBJ)

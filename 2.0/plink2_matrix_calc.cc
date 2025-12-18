@@ -55,6 +55,9 @@ void InitScore(ScoreInfo* score_info_ptr) {
   score_info_ptr->qsr_data_fname = nullptr;
   score_info_ptr->qsr_varid_col_p1 = 1;
   score_info_ptr->qsr_val_col_p1 = 0;  // defensive
+
+  score_info_ptr->sparse_snp_map_fname = nullptr;
+  score_info_ptr->sparse_score_map_fname = nullptr;
 }
 
 void CleanupScore(ScoreInfo* score_info_ptr) {
@@ -63,6 +66,9 @@ void CleanupScore(ScoreInfo* score_info_ptr) {
 
   free_cond(score_info_ptr->qsr_range_fname);
   free_cond(score_info_ptr->qsr_data_fname);
+
+  free_cond(score_info_ptr->sparse_snp_map_fname);
+  free_cond(score_info_ptr->sparse_score_map_fname);
 }
 
 void InitPhenoSvd(PhenoSvdInfo* pheno_svd_info_ptr) {
@@ -6326,6 +6332,318 @@ PglErr CalcPca(const uintptr_t* sample_include, const SampleIdInfo* siip, const 
 }
 #endif
 
+// Parse Matrix Market format sparse matrix and convert to PLINK2 score format
+// Returns temporary filename in tmp_fname (caller must free and unlink)
+PglErr ParseMatrixMarketSparse(const char* mm_fname, const char* snp_map_fname, const char* score_map_fname, char** tmp_fname_ptr) {
+  unsigned char* bigstack_mark = g_bigstack_base;
+  PglErr reterr = kPglRetSuccess;
+  TextStream mm_txs;
+  TextStream snp_map_txs;
+  TextStream score_map_txs;
+  FILE* outfile = nullptr;
+  char* tmp_fname = nullptr;
+  PreinitTextStream(&mm_txs);
+  PreinitTextStream(&snp_map_txs);
+  PreinitTextStream(&score_map_txs);
+
+  // Hash table for SNP mappings: row index -> (variant_id, allele)
+  // Using a simple array for now, assuming row indices are 1-based and sequential
+  const uint32_t kMaxSnpRows = 10000000;  // Reasonable limit
+  char** snp_variant_ids = nullptr;
+  char* snp_alleles = nullptr;
+  char** score_names = nullptr;
+  uint32_t num_snps = 0;
+  uint32_t num_scores = 0;
+  uint32_t num_nonzeros = 0;
+
+  {
+    reterr = SizeAndInitTextStream(mm_fname, bigstack_left() / 4, 1, &mm_txs);
+    if (unlikely(reterr)) {
+      goto ParseMatrixMarketSparse_ret_TSTREAM_FAIL;
+    }
+
+    // Read Matrix Market header
+    const char* header_line = TextGet(&mm_txs);
+    if (unlikely(!header_line)) {
+      logerrprintfww("Error: Empty Matrix Market file: %s\n", mm_fname);
+      goto ParseMatrixMarketSparse_ret_MALFORMED_INPUT;
+    }
+    // Check for Matrix Market header
+    const char* header_end = TextLineEnd(&mm_txs);
+    const uint32_t header_slen = header_end - header_line;
+    if (unlikely(!StrStartsWith(header_line, "%%MatrixMarket", header_slen))) {
+      logerrprintfww("Error: Invalid Matrix Market header in %s (expected %%MatrixMarket)\n", mm_fname);
+      goto ParseMatrixMarketSparse_ret_MALFORMED_INPUT;
+    }
+
+    // Read comments and extract mappings if present
+    const char* line = TextGet(&mm_txs);
+    while (line && line[0] == '%') {
+      // Could parse SNP/score mappings from comments here
+      // For now, we'll rely on separate mapping files
+      line = TextGet(&mm_txs);
+    }
+
+    // Read dimensions line: rows cols nonzeros
+    if (unlikely(!line)) {
+      logerrprintfww("Error: Missing dimensions line in Matrix Market file: %s\n", mm_fname);
+      goto ParseMatrixMarketSparse_ret_MALFORMED_INPUT;
+    }
+    const char* dims_start = line;
+    num_snps = strtoumax(dims_start, nullptr, 10);
+    dims_start = FirstNonTspace(dims_start);
+    dims_start = NextToken(dims_start);
+    if (unlikely(!dims_start)) {
+      goto ParseMatrixMarketSparse_ret_MALFORMED_INPUT;
+    }
+    num_scores = strtoumax(dims_start, nullptr, 10);
+    dims_start = FirstNonTspace(dims_start);
+    dims_start = NextToken(dims_start);
+    if (dims_start) {
+      num_nonzeros = strtoumax(dims_start, nullptr, 10);
+    }
+
+    if (unlikely(num_snps == 0 || num_scores == 0 || num_snps > kMaxSnpRows)) {
+      logerrprintfww("Error: Invalid dimensions in Matrix Market file: %s (rows=%u, cols=%u)\n", mm_fname, num_snps, num_scores);
+      goto ParseMatrixMarketSparse_ret_MALFORMED_INPUT;
+    }
+
+    // Allocate arrays for SNP and score mappings
+    if (unlikely(bigstack_end_clalloc_cp(num_snps, &snp_variant_ids) ||
+                 bigstack_end_clalloc_c(num_snps, &snp_alleles) ||
+                 bigstack_end_clalloc_cp(num_scores, &score_names))) {
+      goto ParseMatrixMarketSparse_ret_NOMEM;
+    }
+
+    // Load SNP mapping file if provided
+    if (snp_map_fname) {
+      reterr = SizeAndInitTextStream(snp_map_fname, bigstack_left() / 4, 1, &snp_map_txs);
+      if (unlikely(reterr)) {
+        goto ParseMatrixMarketSparse_ret_SNP_MAP_TSTREAM_FAIL;
+      }
+      uintptr_t line_idx = 0;
+      while (1) {
+        ++line_idx;
+        const char* map_line = TextGet(&snp_map_txs);
+        if (!map_line) {
+          if (likely(!TextStreamErrcode2(&snp_map_txs, &reterr))) {
+            break;
+          }
+          goto ParseMatrixMarketSparse_ret_SNP_MAP_TSTREAM_FAIL;
+        }
+        if (map_line[0] == '#') {
+          continue;
+        }
+        const char* row_idx_start = map_line;
+        uint32_t row_idx = strtoumax(row_idx_start, nullptr, 10);
+        if (unlikely(row_idx == 0 || row_idx > num_snps)) {
+          continue;  // Skip invalid row indices
+        }
+        const char* variant_id_start = FirstNonTspace(row_idx_start);
+        variant_id_start = NextToken(variant_id_start);
+        if (unlikely(!variant_id_start)) {
+          continue;
+        }
+        const char* variant_id_end = CurTokenEnd(variant_id_start);
+        const char* allele_start = FirstNonTspace(variant_id_end);
+        if (unlikely(!allele_start)) {
+          continue;
+        }
+        const char* allele_end = CurTokenEnd(allele_start);
+        const uint32_t variant_id_slen = variant_id_end - variant_id_start;
+        const uint32_t allele_slen = allele_end - allele_start;
+        if (unlikely(allele_slen != 1)) {
+          continue;  // Allele should be single character
+        }
+        if (unlikely(bigstack_end_alloc_c(variant_id_slen + 1, &(snp_variant_ids[row_idx - 1])))) {
+          goto ParseMatrixMarketSparse_ret_NOMEM;
+        }
+        memcpyx(snp_variant_ids[row_idx - 1], variant_id_start, variant_id_slen, '\0');
+        snp_alleles[row_idx - 1] = allele_start[0];
+      }
+    }
+
+    // Load score mapping file if provided
+    if (score_map_fname) {
+      reterr = SizeAndInitTextStream(score_map_fname, bigstack_left() / 4, 1, &score_map_txs);
+      if (unlikely(reterr)) {
+        goto ParseMatrixMarketSparse_ret_SCORE_MAP_TSTREAM_FAIL;
+      }
+      uintptr_t line_idx = 0;
+      while (1) {
+        ++line_idx;
+        const char* map_line = TextGet(&score_map_txs);
+        if (!map_line) {
+          if (likely(!TextStreamErrcode2(&score_map_txs, &reterr))) {
+            break;
+          }
+          goto ParseMatrixMarketSparse_ret_SCORE_MAP_TSTREAM_FAIL;
+        }
+        if (map_line[0] == '#') {
+          continue;
+        }
+        const char* col_idx_start = map_line;
+        uint32_t col_idx = strtoumax(col_idx_start, nullptr, 10);
+        if (unlikely(col_idx == 0 || col_idx > num_scores)) {
+          continue;  // Skip invalid column indices
+        }
+        const char* score_name_start = FirstNonTspace(col_idx_start);
+        score_name_start = NextToken(score_name_start);
+        if (unlikely(!score_name_start)) {
+          continue;
+        }
+        const char* score_name_end = CurTokenEnd(score_name_start);
+        const uint32_t score_name_slen = score_name_end - score_name_start;
+        if (unlikely(bigstack_end_alloc_c(score_name_slen + 1, &(score_names[col_idx - 1])))) {
+          goto ParseMatrixMarketSparse_ret_NOMEM;
+        }
+        memcpyx(score_names[col_idx - 1], score_name_start, score_name_slen, '\0');
+      }
+    }
+
+    // Generate default score names if not provided
+    for (uint32_t col_idx = 0; col_idx != num_scores; ++col_idx) {
+      if (!score_names[col_idx]) {
+        const uint32_t score_name_blen = 6 + UintSlen(col_idx + 1);
+        if (unlikely(bigstack_end_alloc_c(score_name_blen, &(score_names[col_idx])))) {
+          goto ParseMatrixMarketSparse_ret_NOMEM;
+        }
+        char* write_iter = strcpya_k(score_names[col_idx], "SCORE");
+        u32toa_x(col_idx + 1, '\0', write_iter);
+      }
+    }
+
+    // Create temporary output file
+    const uint32_t tmp_fname_blen = strlen(mm_fname) + 16;
+    if (unlikely(bigstack_end_alloc_c(tmp_fname_blen, &tmp_fname))) {
+      goto ParseMatrixMarketSparse_ret_NOMEM;
+    }
+    snprintf(tmp_fname, tmp_fname_blen, "%s.plink2.tmp", mm_fname);
+    if (unlikely(fopen_checked(tmp_fname, FOPEN_WB, &outfile))) {
+      goto ParseMatrixMarketSparse_ret_OPEN_FAIL;
+    }
+
+    // Write header line
+    fputs("VARIANT_ID\tALLELE", outfile);
+    for (uint32_t col_idx = 0; col_idx != num_scores; ++col_idx) {
+      fputc('\t', outfile);
+      fputs(score_names[col_idx], outfile);
+    }
+    fputc('\n', outfile);
+
+    // Read sparse matrix data and build dense representation
+    // For efficiency with very sparse matrices, we'll use a hash table
+    // But for simplicity, we'll use a 2D array indexed by (row-1, col-1)
+    double** matrix_data = nullptr;
+    if (unlikely(bigstack_alloc_dp(num_snps, &matrix_data))) {
+      goto ParseMatrixMarketSparse_ret_NOMEM;
+    }
+    for (uint32_t row_idx = 0; row_idx != num_snps; ++row_idx) {
+      if (unlikely(bigstack_calloc_d(num_scores, &(matrix_data[row_idx])))) {
+        goto ParseMatrixMarketSparse_ret_NOMEM;
+      }
+    }
+
+    // Read matrix entries
+    uintptr_t line_idx = 0;
+    while (1) {
+      ++line_idx;
+      const char* data_line = TextGet(&mm_txs);
+      if (!data_line) {
+        if (likely(!TextStreamErrcode2(&mm_txs, &reterr))) {
+          break;
+        }
+        goto ParseMatrixMarketSparse_ret_TSTREAM_FAIL;
+      }
+      if (data_line[0] == '%') {
+        continue;  // Skip comment lines
+      }
+      const char* row_start = data_line;
+      uint32_t row = strtoumax(row_start, nullptr, 10);
+      if (unlikely(row == 0 || row > num_snps)) {
+        continue;  // Skip invalid rows
+      }
+      const char* col_start = FirstNonTspace(row_start);
+      col_start = NextToken(col_start);
+      if (unlikely(!col_start)) {
+        continue;
+      }
+      uint32_t col = strtoumax(col_start, nullptr, 10);
+      if (unlikely(col == 0 || col > num_scores)) {
+        continue;  // Skip invalid columns
+      }
+      const char* value_start = FirstNonTspace(col_start);
+      value_start = NextToken(value_start);
+      if (unlikely(!value_start)) {
+        continue;
+      }
+      double value;
+      if (unlikely(!ScantokDouble(value_start, &value))) {
+        continue;  // Skip invalid values
+      }
+      matrix_data[row - 1][col - 1] = value;
+    }
+
+    // Write data rows
+    for (uint32_t row_idx = 0; row_idx != num_snps; ++row_idx) {
+      if (!snp_variant_ids[row_idx]) {
+        // Skip rows without SNP mapping
+        continue;
+      }
+      fputs(snp_variant_ids[row_idx], outfile);
+      fputc('\t', outfile);
+      fputc(snp_alleles[row_idx], outfile);
+      for (uint32_t col_idx = 0; col_idx != num_scores; ++col_idx) {
+        fputc('\t', outfile);
+        char float_buf[32];
+        snprintf(float_buf, sizeof(float_buf), "%.10g", matrix_data[row_idx][col_idx]);
+        fputs(float_buf, outfile);
+      }
+      fputc('\n', outfile);
+    }
+
+    if (unlikely(fclose_null(&outfile))) {
+      goto ParseMatrixMarketSparse_ret_WRITE_FAIL;
+    }
+    *tmp_fname_ptr = tmp_fname;
+    tmp_fname = nullptr;  // Transfer ownership
+  }
+  while (0) {
+  ParseMatrixMarketSparse_ret_NOMEM:
+    reterr = kPglRetNomem;
+    break;
+  ParseMatrixMarketSparse_ret_TSTREAM_FAIL:
+    TextStreamErrPrint(mm_fname, &mm_txs);
+    break;
+  ParseMatrixMarketSparse_ret_SNP_MAP_TSTREAM_FAIL:
+    TextStreamErrPrint(snp_map_fname, &snp_map_txs);
+    break;
+  ParseMatrixMarketSparse_ret_SCORE_MAP_TSTREAM_FAIL:
+    TextStreamErrPrint(score_map_fname, &score_map_txs);
+    break;
+  ParseMatrixMarketSparse_ret_MALFORMED_INPUT:
+    reterr = kPglRetMalformedInput;
+    break;
+  ParseMatrixMarketSparse_ret_OPEN_FAIL:
+    logerrprintfww(kErrprintfFopen, tmp_fname? tmp_fname : "(temporary)", strerror(errno));
+    reterr = kPglRetOpenFail;
+    break;
+  ParseMatrixMarketSparse_ret_WRITE_FAIL:
+    reterr = kPglRetWriteFail;
+    break;
+  }
+  fclose_cond(outfile);
+  CleanupTextStream2("Matrix Market file", &mm_txs, &reterr);
+  CleanupTextStream2("SNP mapping file", &snp_map_txs, &reterr);
+  CleanupTextStream2("Score mapping file", &score_map_txs, &reterr);
+  if (tmp_fname && tmp_fname != *tmp_fname_ptr) {
+    unlink(tmp_fname);
+    BigstackReset(tmp_fname);
+  }
+  BigstackReset(bigstack_mark);
+  return reterr;
+}
+
 PglErr ScoreListLoad(const char* list_fname, TextStream* score_txsp, LlStr** fname_iterp, uint32_t* infile_ctp) {
   PglErr reterr = kPglRetSuccess;
   {
@@ -6897,10 +7215,23 @@ PglErr ScoreReport(const uintptr_t* sample_include, const SampleIdInfo* siip, co
   TextStream score_txs;
   ThreadGroup tg;
   CompressStreamState css;
+  char* sparse_tmp_fname = nullptr;  // Temporary file for converted sparse matrix
   PreinitTextStream(&score_txs);
   PreinitThreads(&tg);
   PreinitCstream(&css);
   {
+    // Convert Matrix Market sparse matrix to PLINK2 format if needed
+    const uint32_t is_sparse_matrix = (score_info_ptr->flags / kfScoreSparseMatrix) & 1;
+    if (is_sparse_matrix) {
+      reterr = ParseMatrixMarketSparse(score_info_ptr->input_fname, score_info_ptr->sparse_snp_map_fname, score_info_ptr->sparse_score_map_fname, &sparse_tmp_fname);
+      if (unlikely(reterr)) {
+        goto ScoreReport_ret_1;
+      }
+      // Update input_fname to point to converted file
+      // We'll restore it later, but for now we need to use the temp file
+      // Actually, we can't modify score_info_ptr->input_fname since it's const
+      // So we'll track the original and use sparse_tmp_fname when needed
+    }
     const uint32_t raw_variant_ctl = BitCtToWordCt(raw_variant_ct);
     if (!xchr_model) {
       uint32_t x_code;
@@ -7165,17 +7496,26 @@ PglErr ScoreReport(const uintptr_t* sample_include, const SampleIdInfo* siip, co
       // qsr_include.
       // but for now, we just free already_seen, and in the common use cases
       // this should be fine.
-      reterr = TextRetarget(score_info_ptr->input_fname, &score_txs);
+      const char* score_fname_to_use = sparse_tmp_fname? sparse_tmp_fname : score_info_ptr->input_fname;
+      reterr = TextRetarget(score_fname_to_use, &score_txs);
       if (unlikely(reterr)) {
-        cur_input_fname = score_info_ptr->input_fname;
+        cur_input_fname = score_fname_to_use;
         goto ScoreReport_ret_TSTREAM_FAIL;
       }
       BigstackReset(bigstack_mark2);
       line_idx = 0;
     } else {
-      reterr = SizeAndInitTextStream(score_info_ptr->input_fname, bigstack_left() / 8, 1, &score_txs);
+      // When there's no q-score-range, score_txs may not be initialized yet
+      const char* score_fname_to_use = sparse_tmp_fname? sparse_tmp_fname : score_info_ptr->input_fname;
+      if (score_info_ptr->qsr_range_fname) {
+        // score_txs was already initialized for q-score-range, just retarget it
+        reterr = TextRetarget(score_fname_to_use, &score_txs);
+      } else {
+        // score_txs was never initialized, need to initialize it
+        reterr = SizeAndInitTextStream(score_fname_to_use, bigstack_left() / 8, 1, &score_txs);
+      }
       if (unlikely(reterr)) {
-        cur_input_fname = score_info_ptr->input_fname;
+        cur_input_fname = score_fname_to_use;
         goto ScoreReport_ret_TSTREAM_FAIL;
       }
     }
@@ -7185,8 +7525,57 @@ PglErr ScoreReport(const uintptr_t* sample_include, const SampleIdInfo* siip, co
     uint32_t relevant_col_idx_end = MAXV(varid_col_idx, allele_col_idx);
     uint32_t* score_col_idx_deltas = nullptr;
     uintptr_t score_col_ct = 1;
-    if (!score_info_ptr->input_col_idx_range_list.name_ct) {
-      // catch edge case
+    
+    // For sparse-matrix format, if no --score-col-nums specified, process all score columns
+    if (is_sparse_matrix && !score_info_ptr->input_col_idx_range_list.name_ct) {
+      // Read the converted file header to determine number of score columns
+      const char* score_fname_to_check = sparse_tmp_fname? sparse_tmp_fname : score_info_ptr->input_fname;
+      TextStream header_txs;
+      PreinitTextStream(&header_txs);
+      reterr = SizeAndInitTextStream(score_fname_to_check, bigstack_left() / 8, 1, &header_txs);
+      if (likely(!reterr)) {
+        const char* header_line = TextGet(&header_txs);
+        if (header_line) {
+          // Count columns in header (VARIANT_ID, ALLELE, then score columns)
+          uint32_t col_count = 0;
+          const char* line_iter = header_line;
+          while (1) {
+            line_iter = FirstNonTspace(line_iter);
+            if (!line_iter || (*line_iter == '\n') || (*line_iter == '\r')) {
+              break;
+            }
+            ++col_count;
+            line_iter = CurTokenEnd(line_iter);
+          }
+          if (col_count > 2) {
+            // We have VARIANT_ID (col 1), ALLELE (col 2), and score columns (col 3+)
+            score_col_ct = col_count - 2;
+            // Set up to process columns 3 through col_count (1-based indexing)
+            // score_col_idx_deltas stores the column indices (1-based), then converted to deltas
+            if (unlikely(bigstack_alloc_u32(score_col_ct, &score_col_idx_deltas))) {
+              CleanupTextStream2("sparse matrix header", &header_txs, &reterr);
+              goto ScoreReport_ret_NOMEM;
+            }
+            // Columns are 3, 4, 5, ... col_count (1-based)
+            for (uint32_t col_idx = 0; col_idx != score_col_ct; ++col_idx) {
+              score_col_idx_deltas[col_idx] = allele_col_idx + 1 + col_idx;  // Store absolute column index (1-based)
+            }
+            // Convert to deltas (difference between consecutive columns)
+            for (uint32_t col_idx = score_col_ct - 1; col_idx; --col_idx) {
+              score_col_idx_deltas[col_idx] -= score_col_idx_deltas[col_idx - 1];
+            }
+            relevant_col_idx_end = col_count - 1;
+          }
+        }
+        CleanupTextStream2("sparse matrix header", &header_txs, &reterr);
+      }
+      if (unlikely(reterr)) {
+        goto ScoreReport_ret_1;
+      }
+    }
+    
+    if (!score_info_ptr->input_col_idx_range_list.name_ct && !is_sparse_matrix) {
+      // catch edge case (original behavior for non-sparse format)
       const uint32_t score_col_idx = allele_col_idx + 1;
       if (unlikely(score_col_idx == varid_col_idx)) {
         logerrprintf("Error: --score%s variant ID column index matches a coefficient column index.\n", multi_input? "-list" : "");
@@ -8708,6 +9097,15 @@ PglErr ScoreReport(const uintptr_t* sample_include, const SampleIdInfo* siip, co
   CleanupThreads(&tg);
   BLAS_SET_NUM_THREADS(1);
   CleanupTextStream2("--score[-list] file", &score_txs, &reterr);
+  // Clean up temporary sparse matrix file if it was created
+  if (sparse_tmp_fname) {
+    if (unlikely(unlink(sparse_tmp_fname))) {
+      if (reterr == kPglRetSuccess) {
+        logerrprintfww("Warning: Failed to delete temporary sparse matrix file %s : %s.\n", sparse_tmp_fname, strerror(errno));
+      }
+    }
+    BigstackReset(sparse_tmp_fname);
+  }
   BigstackDoubleReset(bigstack_mark, bigstack_end_mark);
   return reterr;
 }

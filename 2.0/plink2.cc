@@ -11448,6 +11448,8 @@ int main(int argc, char** argv) {
               pc.score_info.flags |= kfScoreListVariants;
             } else if (strequal_k(cur_modif, "list-variants-zs", cur_modif_slen)) {
               pc.score_info.flags |= kfScoreListVariants | kfScoreListVariantsZs;
+            } else if (strequal_k(cur_modif, "sparse-matrix", cur_modif_slen)) {
+              pc.score_info.flags |= kfScoreSparseMatrix;
             } else if (StrStartsWith(cur_modif, "cols=", cur_modif_slen)) {
               if (unlikely(pc.score_info.flags & kfScoreColAll)) {
                 logerrputs("Error: Multiple --score[-list] cols= modifiers.\n");
@@ -11530,6 +11532,22 @@ int main(int argc, char** argv) {
             goto main_ret_1;
           }
           score_col_nums_present = 1;
+        } else if (strequal_k_unsafe(flagname_p2, "core-snp-map")) {
+          if (unlikely(EnforceParamCtRange(argvk[arg_idx], param_ct, 1, 1))) {
+            goto main_ret_INVALID_CMDLINE_2A;
+          }
+          reterr = AllocFname(argvk[arg_idx + 1], flagname_p, &pc.score_info.sparse_snp_map_fname);
+          if (unlikely(reterr)) {
+            goto main_ret_1;
+          }
+        } else if (strequal_k_unsafe(flagname_p2, "core-score-map")) {
+          if (unlikely(EnforceParamCtRange(argvk[arg_idx], param_ct, 1, 1))) {
+            goto main_ret_INVALID_CMDLINE_2A;
+          }
+          reterr = AllocFname(argvk[arg_idx + 1], flagname_p, &pc.score_info.sparse_score_map_fname);
+          if (unlikely(reterr)) {
+            goto main_ret_1;
+          }
         } else if (strequal_k_unsafe(flagname_p2, "plit-cat-pheno")) {
           uint32_t first_phenoname_idx = 1;
           for (; first_phenoname_idx <= param_ct; ++first_phenoname_idx) {

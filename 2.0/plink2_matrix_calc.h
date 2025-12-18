@@ -137,6 +137,7 @@ FLAGSET_DEF_START()
 
   kfScoreQsrHeader = (1 << 13),
   kfScoreQsrMin = (1 << 14),
+  kfScoreSparseMatrix = (1 << 26),  // Input is in Matrix Market sparse format
 
   kfScoreColMaybefid = (1 << 15),
   kfScoreColFid = (1 << 16),
@@ -188,6 +189,10 @@ typedef struct ScoreInfoStruct {
   char* qsr_data_fname;
   uint32_t qsr_varid_col_p1;
   uint32_t qsr_val_col_p1;
+
+  // Sparse matrix (Matrix Market format) support
+  char* sparse_snp_map_fname;  // Optional: SNP mapping file (row index -> variant_id allele)
+  char* sparse_score_map_fname;  // Optional: Score mapping file (col index -> score_name)
 } ScoreInfo;
 
 FLAGSET_DEF_START()

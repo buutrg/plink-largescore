@@ -161,5 +161,5 @@ CLEAN = *.o \
         pgenlibr/src/Makevars \
         pgenlibr/src/pgenlibr.so \
         utils/vcf_subset/*.o \
-        bin/plink2 bin/pgen_compress
+        bin/plink2 bin/pgen_compress bin/plinkSparse
 CLEAN2 = $(foreach expr,$(CLEAN),../$(expr))
