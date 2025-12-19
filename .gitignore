@@ -11,3 +11,6 @@ pgen_spec/pgen_spec.toc
 /test_data/
 /results/ 
 /venv/
+
+## Ignore examples folder
+/examples/

@@ -6,8 +6,8 @@
 
 # Does not currently support -DCPU_CHECK_...
 
-BASEFLAGS=-flto -DZSTD_MULTITHREAD -DIGNORE_BUNDLED_ZSTD
-# BASEFLAGS=-g -DZSTD_MULTITHREAD -DIGNORE_BUNDLED_ZSTD
+BASEFLAGS=-g -DZSTD_MULTITHREAD -DIGNORE_BUNDLED_ZSTD
+# BASEFLAGS=-flto -DZSTD_MULTITHREAD -DIGNORE_BUNDLED_ZSTD
 # BASEFLAGS=-flto -mavx2 -mbmi -mbmi2 -mfma -mlzcnt -DZSTD_MULTITHREAD
 # BASEFLAGS=-flto -msse4.2 -DZSTD_MULTITHREAD
 
@@ -32,7 +32,12 @@ ARCH32		?=
 # Mandatory flags added to defaults or env settings
 CFLAGS		+= -std=gnu99 $(BASEFLAGS) $(CWARN) $(CINCLUDE)
 CXXFLAGS	+= -std=c++14 $(BASEFLAGS) $(CXXWARN) $(CXXINCLUDE)
-LDFLAGS		+= -lm -lpthread -flto $(ZLIB) $(ZSTD)
+
+# Ensure system/conda headers (including zlib.h) are visible
+CFLAGS		+= -I/n/home03/btruong/miniconda3_231202/include
+CXXFLAGS	+= -I/n/home03/btruong/miniconda3_231202/include
+# Linker flags: math, pthread, compression + extra system libs (no LTO for debugging)
+LDFLAGS		+= -lm -lpthread $(ZLIB) $(ZSTD) -lrt -pthread -lresolv
 
 # Installation defaults
 MKDIR		?= mkdir

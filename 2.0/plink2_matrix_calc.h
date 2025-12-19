@@ -193,6 +193,24 @@ typedef struct ScoreInfoStruct {
   // Sparse matrix (Matrix Market format) support
   char* sparse_snp_map_fname;  // Optional: SNP mapping file (row index -> variant_id allele)
   char* sparse_score_map_fname;  // Optional: Score mapping file (col index -> score_name)
+  
+  // In-memory sparse matrix index structure (replaces temp file)
+  // Instead of storing full entries, we use an index to map (variant_id, allele) to coefficients
+  typedef struct SparseMatrixIndexEntryStruct {
+    char* variant_id;  // Variant ID string
+    char allele;  // Allele character
+    uint32_t coeff_start_idx;  // Start index in sparse_coefficients array
+    uint32_t coeff_count;  // Number of non-zero coefficients for this variant+allele
+    uint32_t* col_indices;  // Column indices (which scores have non-zero values)
+  } SparseMatrixIndexEntry;
+  
+  SparseMatrixIndexEntry* sparse_matrix_index;  // Index array mapping variant_id+allele to coefficients
+  uint32_t sparse_matrix_index_ct;  // Number of index entries
+  double* sparse_coefficients;  // Compact array of only non-zero coefficient values
+  uint32_t sparse_coefficients_ct;  // Total number of non-zero coefficients
+  uint32_t sparse_matrix_num_scores;  // Number of score columns
+  uint32_t* sparse_matrix_htable;  // Hash table for variant_id+allele lookup
+  uint32_t sparse_matrix_htable_size;  // Hash table size
 } ScoreInfo;
 
 FLAGSET_DEF_START()
